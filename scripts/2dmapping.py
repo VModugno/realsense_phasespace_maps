@@ -30,9 +30,11 @@ import time
 import cv2
 import numpy as np
 import pyrealsense2 as rs
+import open3d as o3d
+import copy
 import rospy
 from std_msgs.msg import String
-#from phasespace.msg import Markers as markers_msg
+from phasespace.msg import Markers as markers_msg
 
 
 class AppState:
@@ -100,7 +102,8 @@ w, h = depth_intrinsics.width, depth_intrinsics.height
 pc = rs.pointcloud()
 decimate = rs.decimation_filter()
 decimate.set_option(rs.option.filter_magnitude, 2 ** state.decimate)
-colorizer = rs.colorizer()
+align_to = rs.stream.color
+align = rs.align(align_to)
 
 
 def mouse_cb(event, x, y, flags, param):
@@ -278,6 +281,44 @@ def pointcloud(out, verts, texcoords, color, painter=True):
     out[i[m], j[m]] = color[u[m], v[m]]
 
 
+def pointTotest(out, verts, color_list, painter=True):
+    """draw point cloud with optional painter's algorithm"""
+    if len(verts) > 0:
+        if painter:
+            # Painter's algo, sort points from back to front
+
+            # get reverse sorted indices by z (in view-space)
+            # https://gist.github.com/stevenvo/e3dad127598842459b68
+            v = view(verts)
+            s = v[:, 2].argsort()[::-1]
+            proj = project(v[s])
+        else:
+            proj = project(view(verts))
+
+        if state.scale:
+            proj *= 0.5**state.decimate
+
+        h, w = out.shape[:2]
+
+        # proj now contains 2d image coordinates
+        j, i = proj.astype(np.uint32).T
+
+        # create a mask to ignore out-of-bound indices
+        im = (i >= 0) & (i < h)
+        jm = (j >= 0) & (j < w)
+        m = im & jm
+
+
+        # perform uv-coloring in a small center around the desired point
+        out[i[m], j[m]] = np.array(color_list)[m]
+        out[i[m]-1, j[m]-1] = np.array(color_list)[m]
+        out[i[m]+1, j[m]+1] = np.array(color_list)[m]
+        out[i[m]-1, j[m]+1] = np.array(color_list)[m]
+        out[i[m]+1, j[m]-1] = np.array(color_list)[m]
+    else:
+        print("no point found")
+
+
 out = np.empty((h, w, 3), dtype=np.uint8)
 
 class twoDmapper:
@@ -285,14 +326,67 @@ class twoDmapper:
     def __init__(self):
         # with this variables I control when starting the computation of the transformation and it does it only once 
         self.start_computing_transformation = False
+        self.start_data_acquisition_realsense =False
         self.data_acquired_from_realsense = False
-        self.markers_phasespace = []
-        self.markers_realsense = []
-        self.transformation_matrix = []
+        # phasepsace data
+        self.DDDmarkers_phasespace = []
+        # realsense data
         self.realsensePC = []
         self.realsensetextureCoord = [] 
         self.twoDmarkersCoord = []
+        self.DDDmarkers_realsense = []
+        self.DDDmarkers_realsense_color = []
+        # rigid transformation
+        self.transformation_matrix = []
 
+    def computeFPFH(self, point_cloud):
+        # Compute FPFH features
+        radius_normal = 0.1  # Radius for normal estimation
+        radius_feature = 0.2  # Radius for FPFH feature computation
+
+        # Estimate normals for the point cloud
+        o3d.geometry.estimate_normals(
+            point_cloud,
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30)
+        )
+
+        # Compute FPFH features
+        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            point_cloud,
+            o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100)
+        )
+        return fpfh
+
+    def execute_global_registration(self,source_down, target_down, source_fpfh,
+                                target_fpfh, voxel_size):
+        distance_threshold = voxel_size * 1.5
+        print(":: RANSAC registration on downsampled point clouds.")
+        print("   Since the downsampling voxel size is %.3f," % voxel_size)
+        print("   we use a liberal distance threshold %.3f." % distance_threshold)
+        result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+            source_down, target_down, source_fpfh, target_fpfh, True,
+            distance_threshold,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+            3, [
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(
+                    0.9),
+                o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(
+                    distance_threshold)
+            ], o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999))
+        
+        return result
+    
+    def draw_registration_result(sself, source, target, transformation):
+        source_temp = copy.deepcopy(source)
+        target_temp = copy.deepcopy(target)
+        source_temp.paint_uniform_color([1, 0.706, 0])
+        target_temp.paint_uniform_color([0, 0.651, 0.929])
+        source_temp.transform(transformation)
+        o3d.visualization.draw_geometries([source_temp, target_temp],
+                                        zoom=0.4559,
+                                        front=[0.6452, -0.3036, -0.7011],
+                                        lookat=[1.9892, 2.0208, 1.8945],
+                                        up=[-0.2779, -0.9482, 0.1556])
 
     # in this function I read from the optitrack system and I store the markers coordinate in a list 
     def reading_marker_phasespace_and_compute_transormation(self, data):
@@ -300,44 +394,63 @@ class twoDmapper:
             # when I have the data from the realsense and I have trigger the computation of the transformation I do it only once
             # when i trigger the computation of the transformation I get the measurements from phasespace
             self.start_computing_transformation = False
+
             for i in range(len(data.markers)):
-                self.markers.append([data.markers[i].x, data.markers[i].y, data.markers[i].z])
-            # here I compute the transformation
-            # first i need to associate the point from the realsense to the point collected with the phasespace
-            # create the distance matrix of the points among each other
-            # i order each row in a crescent way
-            # then I associate the points that have the same distances on the rows of the matrices
+                self.DDDmarkers_phasespace.append([data.markers[i].x, data.markers[i].y, data.markers[i].z])
+            
+            # build the point clouds and the corresponding fpfh features
+            source_point_cloud = o3d.geometry.PointCloud()
+            source_point_cloud.points = o3d.utility.Vector3dVector(np.asarray(self.DDDmarkers_realsense))
+            source_fpfh = self.computeFPFH(source_point_cloud)
 
-            # compute the distance matrix for the points from the realsense
-            self.distance_matrix_phasespace = np.zeros((len(self.markers_phasespace), len(self.markers_phasespace)))
-            for i in range(len(self.markers_phasespace)):
-                distance_matrix_cur_row = np.zeros(len(self.markers_phasespace))
-                for j in range(len(self.markers_phasespace)):
-                    distance_matrix_cur_row[j] = np.linalg.norm(self.markers_phasespace[i] - self.markers_phasespace[j])
-                # here I order the row in a crescent way and i store it in the distance matrix     
-                self.distance_matrix_phasespace[i] = np.sort(distance_matrix_cur_row)
+            target_point_cloud = o3d.geometry.PointCloud()
+            target_point_cloud.points = o3d.utility.Vector3dVector(np.asarray(self.DDDmarkers_phasespace))
+            target_fpfh = self.computeFPFH(target_point_cloud)
 
-            # here i build the index vector that will be used to associate the points from the realsense to the points from the phasespace
-            index_vector = np.zeros(len(self.markers_phasespace))
-            #for i in range(len(self.markers_phasespace)):
-            #    index_vector[i] = np.where(np.linalg.norm(self.distance_matrix_phasespace[i] - self.distance_matrix_realsense[i])<= 0.1[0])[0][0]
+            voxel_size = 0.05  # means 5cm for this dataset
+            ransac_result = self.execute_global_registration(self,source_point_cloud, target_point_cloud, source_fpfh,
+                                target_fpfh, voxel_size)
+
+            # Apply the obtained transformation to the source point cloud
+            transformed_source_cloud = source_point_cloud.transform(ransac_result.transformation)
+
+            # Visualize the aligned point clouds
+            visualizer = o3d.visualization.Visualizer()
+            visualizer.create_window()
+            visualizer.add_geometry(target_point_cloud)
+            visualizer.add_geometry(transformed_source_cloud)
+            visualizer.run()
+            #visualizer.destroy_window()
+
 
         elif not self.data_acquired_from_realsense and self.start_computing_transformation:
             #print warning message
             print("Warning: I can't compute the transformation because I don't have the data from the realsense. acquire them first")
-           
+        else:
+            print("what?")
+            print(self.data_acquired_from_realsense)
+            print(self.start_computing_transformation)
 
 
 
     def reading_marker_realsense(self, color_frame, depth_frame):
-        if  self.data_acquired_from_realsense:
+        if  self.start_data_acquisition_realsense:
+
+            self.start_data_acquisition_realsense = False
+            self.data_acquired_from_realsense = True
+            #each time I collect the point I have to clean the data stored so far 
+            self.realsensePC, self.realsensetextureCoord = [], []
+            self.DDDmarkers_realsense, self.twoDmarkersCoord = [], []
+            self.DDDmarkers_realsense_color = []
+
              # first I search for the red markers from the color frame
             # then I get the depth value of the pixel and I convert it in a 3d point
             # I store the 3d point in a list
             decimated_color_frame = decimate.process(color_frame)
             cv_image = np.array(decimated_color_frame.get_data())
-
-
+             # here I get the depth value of the pixel and I convert it in a 3d point
+            depth_intrinsics = rs.video_stream_profile(depth_frame.profile).get_intrinsics()
+        
             # Select the ROI interactively
             roi = cv2.selectROI("Select ROI", cv_image, fromCenter=False)
 
@@ -349,9 +462,9 @@ class twoDmapper:
             # Convert the image to grayscale
             gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
             # Apply Gaussian blur to reduce noise
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            #blurred = cv2.GaussianBlur(gray, (5, 5), 0)
               # Apply adaptive thresholding to obtain binary image
-            _, thresholded = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+            _, thresholded = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
             # Find contours in the thresholded image
             contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -362,28 +475,31 @@ class twoDmapper:
                 moments = cv2.moments(contour)
 
                 # Calculate the centroid of the contour
-                cx = int(moments["m10"] / moments["m00"])
-                cy = int(moments["m01"] / moments["m00"])
+                if(moments["m00"]>0):
+                    cx = int(moments["m10"] / moments["m00"])
+                    cy = int(moments["m01"] / moments["m00"])
 
-                self.twoDmarkersCoord.append([x_roi+cx, y_roi+cy])
-                
-                radius = 3
-                color = (0, 255, 0)  # Green color
-                thickness = -1  # Filled circle
-                # Draw a rectangle around the contour
-                cv2.circle(cv_image, (x_roi+cx, y_roi+cy), radius, color, thickness)
+                    self.twoDmarkersCoord.append([x_roi+cx, y_roi+cy])
+
+                    # computing the 3d point 
+                    depth = depth_frame.as_depth_frame().get_distance(x_roi+cx, y_roi+cy)
+                    depth_point = rs.rs2_deproject_pixel_to_point(depth_intrinsics, [x_roi+cx, y_roi+cy], depth)
+                    self.DDDmarkers_realsense.append(depth_point)
+
+                    # plot pointson the image
+                    radius = 3
+                    color = (0, 255, 0)  # Green color
+                    self.DDDmarkers_realsense_color.append(color)
+                    thickness = -1  # Filled circle
+                    # Draw a rectangle around the contour
+                    cv2.circle(cv_image, (x_roi+cx, y_roi+cy), radius, color, thickness)
 
         
-            # I show the image
+            # I show the resulting image
             cv2.imshow('color_frame', cv_image)
             cv2.waitKey(1)
 
-
-            depth_intrinsics = rs.video_stream_profile(
-                depth_frame.profile).get_intrinsics()
-            w, h = depth_intrinsics.width, depth_intrinsics.height
-
-
+            # here I compute the pointcloud
             points = pc.calculate(depth_frame)
             pc.map_to(color_frame)
 
@@ -392,7 +508,7 @@ class twoDmapper:
 
 
     def start_realsense_acquisition(self):
-        self.data_acquired_from_realsense = True
+        self.start_data_acquisition_realsense = True
     
     def start_computing_rigid_transform(self):
         self.start_computing_transformation = True
@@ -403,43 +519,43 @@ class twoDmapper:
 
 def main():
 
-    #rospy.init_node('2dmapper', anonymous=True)
-    #rospy.Subscriber("phasespace_markers", markers_msg, twoDmapper.reading_points_callback)
+    rospy.init_node('2dmapper', anonymous=True)
+    rospy.Subscriber("phasespace_markers", markers_msg, twoDmapper.reading_points_callback)
     # here i create the 2d mapper object
 
     mapper = twoDmapper()
 
-    while True:
+    while not rospy.is_shutdown():
         # Grab camera data
         if not state.paused:
             # Wait for a coherent pair of frames: depth and color
             frames = pipeline.wait_for_frames()
-
+            
+            # original frames
             depth_frame = frames.get_depth_frame()
             color_frame = frames.get_color_frame()
 
-            # decimate act as filter to reduce the number of points and get less noisy point cloud
-            depth_frame = decimate.process(depth_frame)
+            # decimated and aligned frames
+            decimated = decimate.process(frames).as_frameset()
+            # Align the depth frame to color frame
+            aligned_frames = align.process(decimated)
+            depth_frame_aligned = aligned_frames.get_depth_frame()
+            color_frame_aligned = aligned_frames.get_color_frame()
 
-            mapper.reading_marker_realsense(color_frame, depth_frame)
+            depth_frame = depth_frame_aligned
 
+            mapper.reading_marker_realsense(color_frame_aligned, depth_frame)
+
+            # data for visualization 
             # Grab new intrinsics (may be changed by decimation)
             depth_intrinsics = rs.video_stream_profile(
                 depth_frame.profile).get_intrinsics()
             w, h = depth_intrinsics.width, depth_intrinsics.height
 
-            
-
             depth_image = np.asanyarray(depth_frame.get_data())
             color_image = np.asanyarray(color_frame.get_data())
 
-            depth_colormap = np.asanyarray(
-                colorizer.colorize(depth_frame).get_data())
-
-            if state.color:
-                mapped_frame, color_source = color_frame, color_image
-            else:
-                mapped_frame, color_source = depth_frame, depth_colormap
+            mapped_frame, color_source = color_frame, color_image
 
             points = pc.calculate(depth_frame)
             pc.map_to(mapped_frame)
@@ -453,7 +569,8 @@ def main():
         now = time.time()
 
         # visualiztion block on the opencv window
-        """ out.fill(0)
+       
+        out.fill(0)
 
         grid(out, (0, 0.5, 1), size=1, n=10)
         frustum(out, depth_intrinsics)
@@ -461,9 +578,13 @@ def main():
 
         if not state.scale or out.shape[:2] == (h, w):
             pointcloud(out, verts, texcoords, color_source)
+            if(mapper.data_acquired_from_realsense):
+                pointTotest(out, mapper.DDDmarkers_realsense,mapper.DDDmarkers_realsense_color)
         else:
             tmp = np.zeros((h, w, 3), dtype=np.uint8)
             pointcloud(tmp, verts, texcoords, color_source)
+            if(mapper.data_acquired_from_realsense):
+                pointTotest(tmp, mapper.DDDmarkers_realsense,mapper.DDDmarkers_realsense_color)
             tmp = cv2.resize(
                 tmp, out.shape[:2][::-1], interpolation=cv2.INTER_NEAREST)
             np.putmask(out, tmp > 0, tmp)
@@ -478,8 +599,8 @@ def main():
             (w, h, 1.0/dt, dt*1000, "PAUSED" if state.paused else ""))
 
         cv2.imshow(state.WIN_NAME, out)
-        """
-        key = cv2.waitKey(1) 
+        
+        key = cv2.waitKey(1)  
         # end visualization block
 
         # Handle key presses
@@ -516,6 +637,8 @@ def main():
 
         if key in (27, ord("q")) or cv2.getWindowProperty(state.WIN_NAME, cv2.WND_PROP_AUTOSIZE) < 0:
             break
+
+        rospy.spin()
 
     # Stop streaming
     pipeline.stop()
