@@ -577,7 +577,7 @@ class twoDmapper:
             #self.realsensePC, self.realsensetextureCoord = points.get_vertices(), points.get_texture_coordinates()
              # Convert RealSense point cloud to Open3D point cloud
            
-            self.point_cloudRS.points = o3d.utility.Vector3dVector(np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3))
+            """ self.point_cloudRS.points = o3d.utility.Vector3dVector(np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3))
             # creating color vector
             texcoordsRS = np.asanyarray(points.get_texture_coordinates()).view(np.float32).reshape(-1, 2)  # uv
             color_source = np.asanyarray(color_frame.get_data())
@@ -585,7 +585,14 @@ class twoDmapper:
             v, u = (texcoordsRS * (cw, ch) + 0.5).astype(np.uint32).T
             # Extract elements based on indices and put them into a 1D array
             color_list = color_source[u, v]
-            self.point_cloudRS.colors = o3d.utility.Vector3dVector(np.asanyarray(color_list))
+            self.point_cloudRS.colors = o3d.utility.Vector3dVector(np.asanyarray(color_list)) """
+            intrinsic = depth_frame.get_profile().as_video_stream_profile().get_intrinsics()
+            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(color_frame,depth_frame, convert_rgb_to_intensity=False)
+            pinhole_camera_intrinsic = o3d.PinholeCameraIntrinsic(intrinsic.width, intrinsic.height, intrinsic.fx,
+                                                                      intrinsic.fy, intrinsic.ppx, intrinsic.ppy)
+            self.point_cloudRS = o3d.create_point_cloud_from_rgbd_image(rgbd_image, pinhole_camera_intrinsic)
+            print(rgbd_image)
+
             # visualizing point cloud
             o3d.visualization.draw_geometries(self.point_cloudRS)
 
