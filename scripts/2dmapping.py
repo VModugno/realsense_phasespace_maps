@@ -107,7 +107,8 @@ depth_intrinsics = depth_profile.get_intrinsics()
 w, h = depth_intrinsics.width, depth_intrinsics.height
 
 # Processing blocks
-pc = rs.pointcloud()
+pc_visualization = rs.pointcloud()
+cur_pc = rs.pointcloud()
 align_to = rs.stream.color
 align = rs.align(align_to)
 decimate = rs.decimation_filter()
@@ -346,14 +347,19 @@ class twoDmapper:
         self.DDDmarkers_phasespace = []
         # realsense data
         self.point_cloudRS = o3d.geometry.PointCloud()
-        #self.realsensePC = []
-        #self.realsensetextureCoord = [] 
+        self.realsensePC = []
+        self.realsensetextureCoord = [] 
         self.twoDmarkersCoord = []
         self.DDDmarkers_realsense = []
         self.DDDmarkers_realsense_color = []
         # rigid transformation
         self.registration_result = []
         self.counter = 0  # just for debugging
+        # final map 
+        self.map = np.zeros((1000, 1000, 3), dtype=np.uint8)
+        self.pixel_centre_x = 500
+        self.pixel_centre_y = 500
+        self.pixel_width = 0.01
 
     def computeFPFH(self, point_cloud):
         # Compute FPFH features
@@ -446,10 +452,19 @@ class twoDmapper:
         vis.destroy_window()
         print("")
         return vis.get_picked_points()
+    
+    def  rotate_point_cloud(self):
+        # Rotate the point cloud to align with the phasespace coordinate system
+        for i in range(len(self.realsensePC)):
+            input_vec = np.append(self.realsensePC[i], 1.0)
+            cur = np.matmul(self.registration_result.transformation, input_vec)
+            self.realsensePC[i] = cur[:3]
+        
 
     # in this function I read from the optitrack system and I store the markers coordinate in a list 
     def reading_marker_phasespace_and_compute_transformation(self, data):
-    
+        #debug
+        #print(self.data_acquired_from_realsense,"   ",self.start_computing_transformation)
         if  self.data_acquired_from_realsense and self.start_computing_transformation:
             # when I have the data from the realsense and I have trigger the computation of the transformation I do it only once
             # when i trigger the computation of the transformation I get the measurements from phasespace
@@ -480,7 +495,7 @@ class twoDmapper:
             #print(trans_init_test)
             #source_point_cloud = copy.deepcopy(target_point_cloud)
             #source_point_cloud.transform(trans_init_test)
-            # debug
+            # debugcd
 
 
             self.draw_registration_result(source_point_cloud, target_point_cloud, np.identity(4))
@@ -493,7 +508,59 @@ class twoDmapper:
 
             self.draw_registration_result(source_point_cloud, target_point_cloud,  self.registration_result.transformation)
 
-            
+            self.point_cloudRS.transform(self.registration_result.transformation)
+
+            # visualize rotated point cloud
+            o3d.visualization.draw_geometries([self.point_cloudRS])
+
+            # Extract point coordinates
+            cur_points = self.point_cloudRS.points
+
+            # Extract color information
+            cur_colors = self.point_cloudRS.colors
+
+            # Convert points and colors to NumPy arrays
+            cur_points_np = np.asarray(cur_points)
+            cur_colors_np = np.asarray(cur_colors)
+
+            # Print the extracted point coordinates and color information
+            print("Point Coordinates:")
+            print(cur_points_np)
+
+            print("Color Information:")
+            print(cur_colors_np)
+
+            for i in range(len(cur_points_np)):
+                grid_coord_x = int(np.floor((cur_points_np[i,2])/self.pixel_width + self.pixel_centre_x))
+                grid_coord_y = int(np.floor((cur_points_np[i,0])/self.pixel_width + self.pixel_centre_y))
+
+                # transform from ROS to CV coordinate:
+                grid_coord_x_cv = 1000 - grid_coord_y
+                grid_coord_y_cv = grid_coord_x
+                self.map[grid_coord_x_cv, grid_coord_y_cv] = cur_colors_np[i,:]
+
+            # appply transformation to the RS point cloud
+            #print("apply rotations to point")
+            #self.rotate_point_cloud()
+            # apply point to map
+            # the phasespace coordinate system is y up instead of z up.
+            # hence phasespace (x,y,z) -> (z,x,y) in ROS
+            #print("write the point cloud to the map")
+            #cw, ch = self.current_color_frame.shape[:2][::-1]
+            #v, u = (self.realsensetextureCoord * (cw, ch) + 0.5).astype(np.uint32).T
+            #for i in range(len(self.realsensePC)):
+            #    grid_coord_x = int(np.floor((self.realsensePC[i,2])/self.pixel_width + self.pixel_centre_x))
+            #    grid_coord_y = int(np.floor((self.realsensePC[i,0])/self.pixel_width + self.pixel_centre_y))
+
+                # transform from ROS to CV coordinate:
+            #    grid_coord_x_cv = 1000 - grid_coord_y
+            #    grid_coord_y_cv = grid_coord_x
+            #    self.map[grid_coord_x_cv, grid_coord_y_cv] = self.current_color_frame[u[i], v[i]]
+
+            # plot map
+            print("plot the current map")
+            cv2.imshow("current map", self.map)
+            key = cv2.waitKey(1)  
 
         elif not self.data_acquired_from_realsense and self.start_computing_transformation:
             #print warning message
@@ -510,8 +577,10 @@ class twoDmapper:
             #self.realsensePC, self.realsensetextureCoord = [], []
             self.DDDmarkers_realsense, self.twoDmarkersCoord = [], []
             self.DDDmarkers_realsense_color = []
-            self.point_cloudRS.clear()
-
+            self.realsensePC, self.realsensetextureCoord = [], []
+            
+            #self.point_cloudRS.clear()
+    
              # first I search for the red markers from the color frame
             # then I get the depth value of the pixel and I convert it in a 3d point
             # I store the 3d point in a list
@@ -570,31 +639,35 @@ class twoDmapper:
             cv2.waitKey(1)
 
             # here I compute the pointcloud
-            points = pc.calculate(depth_frame)
-            pc.map_to(color_frame)
+            #points = cur_pc.calculate(depth_frame)
+            #cur_pc.map_to(color_frame)
+            #v,t = points.get_vertices(), points.get_texture_coordinates()
+            #self.realsensePC = np.asanyarray(v).view(np.float32).reshape(-1, 3)  # xyz
+            #self.realsensetextureCoord = np.asanyarray(t).view(np.float32).reshape(-1, 2) 
+            #self.current_color_frame = np.asanyarray(color_frame.get_data())
+
+            #print("Saving to cur.ply...")
+            #points.export_to_ply("cur.ply", color_frame)
+            #print("Done")
+
+            #self.point_cloudRS = o3d.io.read_point_cloud("cur.ply")
+            #o3d.visualization.draw_geometries(self.point_cloudRS)
 
             # Pointcloud data to arrays
             #self.realsensePC, self.realsensetextureCoord = points.get_vertices(), points.get_texture_coordinates()
              # Convert RealSense point cloud to Open3D point cloud
            
-            """ self.point_cloudRS.points = o3d.utility.Vector3dVector(np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3))
-            # creating color vector
-            texcoordsRS = np.asanyarray(points.get_texture_coordinates()).view(np.float32).reshape(-1, 2)  # uv
-            color_source = np.asanyarray(color_frame.get_data())
-            cw, ch = color_source.shape[:2][::-1]
-            v, u = (texcoordsRS * (cw, ch) + 0.5).astype(np.uint32).T
-            # Extract elements based on indices and put them into a 1D array
-            color_list = color_source[u, v]
-            self.point_cloudRS.colors = o3d.utility.Vector3dVector(np.asanyarray(color_list)) """
             intrinsic = depth_frame.get_profile().as_video_stream_profile().get_intrinsics()
-            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(color_frame,depth_frame, convert_rgb_to_intensity=False)
-            pinhole_camera_intrinsic = o3d.PinholeCameraIntrinsic(intrinsic.width, intrinsic.height, intrinsic.fx,
+            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(o3d.geometry.Image(np.asarray(color_frame.get_data())),o3d.geometry.Image(np.asarray(depth_frame.get_data())),convert_rgb_to_intensity=False)
+            pinhole_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(intrinsic.width, intrinsic.height, intrinsic.fx,
                                                                       intrinsic.fy, intrinsic.ppx, intrinsic.ppy)
-            self.point_cloudRS = o3d.create_point_cloud_from_rgbd_image(rgbd_image, pinhole_camera_intrinsic)
-            print(rgbd_image)
-
+            self.point_cloudRS=o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, pinhole_camera_intrinsic)
+            #print(rgbd_image)
+            
             # visualizing point cloud
-            o3d.visualization.draw_geometries(self.point_cloudRS)
+            o3d.visualization.draw_geometries([self.point_cloudRS])
+
+
 
 
 
@@ -613,7 +686,7 @@ def main():
 
      # here i create the 2d mapper object
     mapper = twoDmapper()
-    rospy.init_node('2dmapper', anonymous=True)
+    rospy.init_node('2dmapper')
     rospy.Subscriber("phasespace_markers", markers_msg, mapper.reading_marker_phasespace_and_compute_transformation)
    
     # Set the publishing rate
@@ -662,8 +735,8 @@ def main():
 
             mapped_frame, color_source = color_frame, color_image
 
-            points = pc.calculate(depth_frame)
-            pc.map_to(mapped_frame)
+            points = pc_visualization.calculate(depth_frame)
+            pc_visualization.map_to(mapped_frame)
 
             # Pointcloud data to arrays
             v, t = points.get_vertices(), points.get_texture_coordinates()
