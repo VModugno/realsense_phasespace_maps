@@ -338,13 +338,14 @@ out = np.empty((h, w, 3), dtype=np.uint8)
 
 class twoDmapper:
     # twoDmapper constructor
-    def __init__(self):
+    def __init__(self,phasespace_markers_id_list=[]):
         # with this variables I control when starting the computation of the transformation and it does it only once 
         self.start_computing_transformation = False
         self.start_data_acquisition_realsense =False
         self.data_acquired_from_realsense = False
         # phasepsace data
         self.DDDmarkers_phasespace = []
+        self.phasespace_markers_id_list = np.asarray(phasespace_markers_id_list)
         # realsense data
         self.point_cloudRS = o3d.geometry.PointCloud()
         self.realsensePC = []
@@ -474,8 +475,14 @@ class twoDmapper:
             for i in range(len(data.markers)):
                 # apparently there are a lot of markers wich are not instantiated and are all in the origin 
                 # we need to exclude them from the computation
-                if(data.markers[i].x != 0 and data.markers[i].y != 0 and data.markers[i].z != 0):
-                    # i need to rescale the coordinates of the markers from millimiters to meters
+                if(self.phasespace_markers_id_list.size !=0):
+                    # i  have an id list so i get onl the markers with the corresponding id
+                    res = np.where(self.phasespace_markers_id_list==data.markers[i].id)
+                    if(res[0].size != 0):
+                        # i need to rescale the coordinates of the markers from millimiters to meters
+                        self.DDDmarkers_phasespace.append([data.markers[i].x/1000, data.markers[i].y/1000, data.markers[i].z/1000])
+                else:
+                    # i do not have any id list so i get all the markers
                     self.DDDmarkers_phasespace.append([data.markers[i].x/1000, data.markers[i].y/1000, data.markers[i].z/1000])
             
             # build the point clouds and the corresponding fpfh features
@@ -537,7 +544,7 @@ class twoDmapper:
                 # transform from ROS to CV coordinate:
                 grid_coord_x_cv = 1000 - grid_coord_y
                 grid_coord_y_cv = grid_coord_x
-                self.map[grid_coord_x_cv, grid_coord_y_cv] = cur_colors_np[i,:]
+                self.map[grid_coord_x_cv, grid_coord_y_cv] = 255*cur_colors_np[i,:]
 
             # appply transformation to the RS point cloud
             #print("apply rotations to point")
@@ -558,9 +565,10 @@ class twoDmapper:
             #    self.map[grid_coord_x_cv, grid_coord_y_cv] = self.current_color_frame[u[i], v[i]]
 
             # plot map
-            print("plot the current map")
-            cv2.imshow("current map", self.map)
-            key = cv2.waitKey(1)  
+            #print("plot the current map")
+            #cv2.imshow("current map", self.map)
+            #key = cv2.waitKey(1)
+               
 
         elif not self.data_acquired_from_realsense and self.start_computing_transformation:
             #print warning message
@@ -663,7 +671,7 @@ class twoDmapper:
                                                                       intrinsic.fy, intrinsic.ppx, intrinsic.ppy)
             self.point_cloudRS=o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, pinhole_camera_intrinsic)
             #print(rgbd_image)
-            
+
             # visualizing point cloud
             o3d.visualization.draw_geometries([self.point_cloudRS])
 
@@ -685,7 +693,9 @@ class twoDmapper:
 def main():
 
      # here i create the 2d mapper object
-    mapper = twoDmapper()
+    #phasespace_marker_id = [8,9,10,11,12,13,14,15]
+    phasespace_marker_id = []
+    mapper = twoDmapper(phasespace_marker_id)
     rospy.init_node('2dmapper')
     rospy.Subscriber("phasespace_markers", markers_msg, mapper.reading_marker_phasespace_and_compute_transformation)
    
@@ -790,6 +800,19 @@ def main():
         if key == ord("s"):
             print("computing transformation matrix using phasespace mocap and apply rigid transform to realsense pointcloud")
             mapper.start_computing_rigid_transform()
+        
+        if key == ord("m"):
+            print("plot current map")
+            cv2.imshow("current_map",mapper.map)
+            key = cv2.waitKey(1)  
+        
+        if key == ord("t"):
+            print("saving current map")
+            # Filename
+            filename = 'savedMap.jpg'
+            # Using cv2.imwrite() method
+            # Saving the image
+            cv2.imwrite(filename, mapper.map)
 
         if key == ord("r"):
             state.reset()
