@@ -35,6 +35,7 @@ import copy
 import rospy
 from std_msgs.msg import String
 from phasespace.msg import Markers as markers_msg
+import os
 
 
 class AppState:
@@ -72,16 +73,25 @@ state = AppState()
 pipeline = rs.pipeline()
 config = rs.config()
 
+
 pipeline_wrapper = rs.pipeline_wrapper(pipeline)
 pipeline_profile = config.resolve(pipeline_wrapper)
 device = pipeline_profile.get_device()
 
+
+
+
  # change presets
 depth_sensor = pipeline_profile.get_device().first_depth_sensor()
-# Set the visual preset option to 3 (High Accuracy) and 5 (medium density) to optimize for the environment
-depth_sensor.set_option(rs.option.visual_preset, 5)
+# Set the visual preset option to 3 (High Accuracy), 4(high density) and 5 (medium density) to optimize for the environment
+depth_sensor.set_option(rs.option.visual_preset, 4)
 # Get the laser power value
 laser_power = depth_sensor.get_option(rs.option.laser_power)
+# fix the exposure value of the color image otherwsie the merge is a mess
+desired_exposure = 282
+color_sensor = pipeline_profile.get_device().query_sensors()[1]
+color_sensor.set_option(rs.option.enable_auto_exposure, False)
+color_sensor.set_option(rs.option.exposure, desired_exposure)
 print(f"Laser Power: {laser_power}")
 
 found_rgb = False
@@ -361,6 +371,9 @@ class twoDmapper:
         self.pixel_centre_x = 500
         self.pixel_centre_y = 500
         self.pixel_width = 0.01
+        # general variables
+        self.path=os.path.realpath(__file__)
+        self.path= os.path.dirname(self.path)
 
     def computeFPFH(self, point_cloud):
         # Compute FPFH features
@@ -489,11 +502,11 @@ class twoDmapper:
             source_point_cloud = o3d.geometry.PointCloud()
             source_point_cloud.points = o3d.utility.Vector3dVector(np.asarray(self.DDDmarkers_realsense))
             source_fpfh = self.computeFPFH(source_point_cloud)
-            print(self.DDDmarkers_realsense)
+            print("3D coordinates of led markers from realsense = ", self.DDDmarkers_realsense)
             target_point_cloud = o3d.geometry.PointCloud()
             target_point_cloud.points = o3d.utility.Vector3dVector(np.asarray(self.DDDmarkers_phasespace))
             target_fpfh = self.computeFPFH(target_point_cloud)
-            print(self.DDDmarkers_phasespace)
+            print("3D coordinates of led markers from phasespace = ",self.DDDmarkers_phasespace)
 
             # debug (testing without noise to check the icp parameters)
             #trans_init_test = np.asarray([[0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0],
@@ -544,31 +557,17 @@ class twoDmapper:
                 # transform from ROS to CV coordinate:
                 grid_coord_x_cv = 1000 - grid_coord_y
                 grid_coord_y_cv = grid_coord_x
-                self.map[grid_coord_x_cv, grid_coord_y_cv] = 255*cur_colors_np[i,:]
-
-            # appply transformation to the RS point cloud
-            #print("apply rotations to point")
-            #self.rotate_point_cloud()
-            # apply point to map
-            # the phasespace coordinate system is y up instead of z up.
-            # hence phasespace (x,y,z) -> (z,x,y) in ROS
-            #print("write the point cloud to the map")
-            #cw, ch = self.current_color_frame.shape[:2][::-1]
-            #v, u = (self.realsensetextureCoord * (cw, ch) + 0.5).astype(np.uint32).T
-            #for i in range(len(self.realsensePC)):
-            #    grid_coord_x = int(np.floor((self.realsensePC[i,2])/self.pixel_width + self.pixel_centre_x))
-            #    grid_coord_y = int(np.floor((self.realsensePC[i,0])/self.pixel_width + self.pixel_centre_y))
-
-                # transform from ROS to CV coordinate:
-            #    grid_coord_x_cv = 1000 - grid_coord_y
-            #    grid_coord_y_cv = grid_coord_x
-            #    self.map[grid_coord_x_cv, grid_coord_y_cv] = self.current_color_frame[u[i], v[i]]
-
-            # plot map
-            #print("plot the current map")
-            #cv2.imshow("current map", self.map)
-            #key = cv2.waitKey(1)
-               
+                curr_color = self.map[grid_coord_x_cv, grid_coord_y_cv]
+                # here i check if the current color is not black 
+                if(curr_color[0] != 0 or curr_color[1] != 0 or curr_color[2] != 0):
+                    # if the new color im adding is not black i'll update the map
+                    if(cur_colors_np[i,0] != 0 or cur_colors_np[i,1] != 0 or cur_colors_np[i,2] != 0):
+                        # if the new color im adding is not black ill update the map
+                        self.map[grid_coord_x_cv, grid_coord_y_cv] = 255*cur_colors_np[i,:]
+                else:
+                    # if the current color is black i'll update the map with the new color
+                    self.map[grid_coord_x_cv, grid_coord_y_cv] = 255*cur_colors_np[i,:]
+                
 
         elif not self.data_acquired_from_realsense and self.start_computing_transformation:
             #print warning message
@@ -646,24 +645,7 @@ class twoDmapper:
             cv2.imshow('color_frame', cv_image)
             cv2.waitKey(1)
 
-            # here I compute the pointcloud
-            #points = cur_pc.calculate(depth_frame)
-            #cur_pc.map_to(color_frame)
-            #v,t = points.get_vertices(), points.get_texture_coordinates()
-            #self.realsensePC = np.asanyarray(v).view(np.float32).reshape(-1, 3)  # xyz
-            #self.realsensetextureCoord = np.asanyarray(t).view(np.float32).reshape(-1, 2) 
-            #self.current_color_frame = np.asanyarray(color_frame.get_data())
-
-            #print("Saving to cur.ply...")
-            #points.export_to_ply("cur.ply", color_frame)
-            #print("Done")
-
-            #self.point_cloudRS = o3d.io.read_point_cloud("cur.ply")
-            #o3d.visualization.draw_geometries(self.point_cloudRS)
-
-            # Pointcloud data to arrays
-            #self.realsensePC, self.realsensetextureCoord = points.get_vertices(), points.get_texture_coordinates()
-             # Convert RealSense point cloud to Open3D point cloud
+            # Convert RealSense point cloud to Open3D point cloud
            
             intrinsic = depth_frame.get_profile().as_video_stream_profile().get_intrinsics()
             rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(o3d.geometry.Image(np.asarray(color_frame.get_data())),o3d.geometry.Image(np.asarray(depth_frame.get_data())),convert_rgb_to_intensity=False)
@@ -685,6 +667,25 @@ class twoDmapper:
     
     def start_computing_rigid_transform(self):
         self.start_computing_transformation = True
+
+    def save_map(self,filename):
+        print("saving current map")
+        # Filename
+        full_path = self.path + "/../scene_maps/" + filename
+        print("full path", full_path)
+        # Using cv2.imwrite() method
+        # Saving the image
+        cv2.imwrite(full_path, self.map)
+    
+    def load_map(self,filename):
+        print("loading map")
+        # Filename
+        full_path = self.path + "/../scene_maps/" + filename
+        print("full path", full_path)
+        # Using cv2.imread() method
+        # to read the image
+        self.map = cv2.imread(full_path)
+               
 
            
     
@@ -807,12 +808,12 @@ def main():
             key = cv2.waitKey(1)  
         
         if key == ord("t"):
-            print("saving current map")
-            # Filename
-            filename = 'savedMap.jpg'
-            # Using cv2.imwrite() method
-            # Saving the image
-            cv2.imwrite(filename, mapper.map)
+            filename = "saved_map.jpg"
+            mapper.save_map(filename)
+        
+        if key == ord("l"):
+            filename = "saved_map.jpg"
+            mapper.load_map(filename)
 
         if key == ord("r"):
             state.reset()
